@@ -2,7 +2,7 @@
 title: Omni Router Manifold Pipeline
 author: Moeakwak
 date: 2025-04-30
-version: 0.4.1
+version: 0.4.2
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -936,9 +936,9 @@ class ServiceBot:
         if args.user_id:
             return self._get_model_stats(args.period, args.user_id, args.provider)
         elif args.model:
-            return self._get_user_stats(args.period, args.model)
+            return self._get_user_stats(args.period, args.model, args.provider)
         else:
-            return self._get_model_stats(args.period, provider=args.provider) + "\n\n" + self._get_user_stats(args.period, args.model)
+            return self._get_model_stats(args.period, provider=args.provider) + "\n\n" + self._get_user_stats(args.period, args.model, args.provider)
 
     def recent(self, args: argparse.Namespace, user: User) -> str:
         return self._get_recent_logs(args.count, args.page, user.id, show_title_generation=args.all, filter_auxiliary_model=not args.all)
@@ -1140,7 +1140,7 @@ Your information:
 
             return resp
 
-    def _get_user_stats(self, period: Optional[str] = None, model: Optional[str] = None) -> str:
+    def _get_user_stats(self, period: Optional[str] = None, model: Optional[str] = None, provider: Optional[str] = None) -> str:
         with Session(self.pipeline.engine) as session:
             # 计算时间范围
             start_time = None
@@ -1174,6 +1174,8 @@ Your information:
                 query = query.where(UsageLog.created_at >= start_time)
             if model:
                 query = query.where(UsageLog.model.like(f"%{model}%"))
+            if provider:
+                query = query.where(UsageLog.provider.like(f"%{provider}%"))
 
             query = query.group_by(User.id).order_by(desc("total_actual_cost"))
 
