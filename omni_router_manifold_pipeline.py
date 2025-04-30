@@ -1,8 +1,8 @@
 """
 title: Omni Router Manifold Pipeline
 author: Moeakwak
-date: 2025-02-19
-version: 0.3.3
+date: 2025-04-30
+version: 0.4.0
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -572,20 +572,6 @@ class Pipeline:
                     delta = chunk["choices"][0].get("delta", {})
                     content_delta = delta.get("content") or ""
                     reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning") or ""
-
-                    # Handle reasoning state transitions using Enum
-                    if reasoning_state == self.ReasoningState.NOT_STARTED and reasoning_delta:
-                        reasoning_state = self.ReasoningState.IN_PROGRESS
-                        chunk["choices"][0]["delta"]["content"] = "<think>\n" + reasoning_delta
-                    elif reasoning_state == self.ReasoningState.IN_PROGRESS:
-                        if reasoning_delta:
-                            chunk["choices"][0]["delta"]["content"] = reasoning_delta
-                        elif content_delta:
-                            reasoning_state = self.ReasoningState.COMPLETED
-                            chunk["choices"][0]["delta"]["content"] = "\n</think>\n\n" + content_delta
-                        else:
-                            chunk["choices"][0]["delta"]["content"] = content_delta
-
                     content += content_delta
                     reasoning_content += reasoning_delta
 
@@ -596,9 +582,12 @@ class Pipeline:
                         last_chunk = chunk
                         message_id = chunk.get("id") if message_id is None else message_id
                         yield "data: " + json.dumps(chunk) + "\n\n"
-                elif "usage" in chunk:
-                    usage = OpenAICompletionUsage(**chunk["usage"])
-                    usage_chunk = chunk
+                elif "usage" in chunk and chunk["usage"] is not None:
+                    try:
+                        usage = OpenAICompletionUsage(**chunk["usage"])
+                        usage_chunk = chunk
+                    except TypeError:
+                        pass
 
             if reasoning_content:
                 print_log(f"reasoning_content length: {len(reasoning_content)}", model, user)
@@ -773,6 +762,7 @@ def add_user_parsers(subparsers: argparse._SubParsersAction) -> dict[str, argpar
     # Stats command
     stats_parser: argparse.ArgumentParser = subparsers.add_parser("stats", help="Show usage statistics")
     stats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], default="d", help="Period (d: daily, w: weekly, m: monthly)")
+    stats_parser.add_argument("--provider", type=str, default=None, help="Filter by provider")
 
     # Recent command
     recent_parser: argparse.ArgumentParser = subparsers.add_parser("recent", help="Show recent usage logs")
@@ -826,6 +816,7 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     gstats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], help="Period (d: daily, w: weekly, m: monthly)")
     gstats_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
     gstats_parser.add_argument("-u", "--user_id", type=str, default=None, help="Filter by user id")
+    gstats_parser.add_argument("--provider", type=str, default=None, help="Filter by provider")
 
     grecent_parser = subparsers.add_parser("grecent", help="Show global recent usage logs")
     grecent_parser.add_argument("-c", "--count", type=int, default=50, help="Number of logs to show")
@@ -906,16 +897,16 @@ class ServiceBot:
 
     # Update the command methods to use the new args format
     def stats(self, args: argparse.Namespace, user: User) -> str:
-        return self._get_model_stats(args.period, user.id)
+        return self._get_model_stats(args.period, user.id, args.provider)
 
     def gstats(self, args: argparse.Namespace, user: User) -> str:
         assert user.role == "admin"
         if args.user_id:
-            return self._get_model_stats(args.period, args.user_id)
+            return self._get_model_stats(args.period, args.user_id, args.provider)
         elif args.model:
             return self._get_user_stats(args.period, args.model)
         else:
-            return self._get_model_stats(args.period) + "\n\n" + self._get_user_stats(args.period, args.model)
+            return self._get_model_stats(args.period, provider=args.provider) + "\n\n" + self._get_user_stats(args.period, args.model)
 
     def recent(self, args: argparse.Namespace, user: User) -> str:
         return self._get_recent_logs(args.count, args.page, user.id, show_title_generation=args.all, filter_auxiliary_model=not args.all)
@@ -1035,8 +1026,7 @@ Your information:
             ]
             return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
 
-    def _get_model_stats(self, period: Optional[str] = None, user_id: Optional[int] = None) -> str:
-
+    def _get_model_stats(self, period: Optional[str] = None, user_id: Optional[int] = None, provider: Optional[str] = None) -> str:
         if period:
             time_delta = {
                 "d": timedelta(days=1),
@@ -1049,6 +1039,7 @@ Your information:
         with Session(self.pipeline.engine) as session:
             query = select(
                 UsageLog.model,
+                UsageLog.provider,
                 func.sum(UsageLog.prompt_tokens).label("total_prompt_tokens"),
                 func.sum(UsageLog.completion_tokens).label("total_completion_tokens"),
                 func.sum(UsageLog.total_tokens).label("total_tokens"),
@@ -1064,32 +1055,25 @@ Your information:
 
             if user_id:
                 query = query.where(UsageLog.user_id == user_id)
+            
+            if provider:
+                query = query.where(UsageLog.provider.like(f"%{provider}%"))
 
-            query = query.group_by(UsageLog.model)
-
-            results = session.exec(query).all()
-
-            if time_delta:
-                start_time = datetime.now() - time_delta
-                query = query.where(UsageLog.created_at >= start_time)
-
-            if user_id:
-                query = query.where(UsageLog.user_id == user_id)
-
-            query = query.group_by(UsageLog.model)
+            query = query.group_by(UsageLog.model, UsageLog.provider)
 
             results = session.exec(query).all()
 
             if not results:
                 return "No usage records found for the specified time period."
 
-            headers = ["Model", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Base Cost", "Actual Cost", "Usage Count"]
+            headers = ["Model", "Provider", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Base Cost", "Actual Cost", "Usage Count"]
             if not user_id:
                 headers.append("Unique Users")
             data = []
             for r in results:
                 row = [
                     r.model,
+                    r.provider,
                     r.total_prompt_tokens,
                     r.total_completion_tokens,
                     r.total_tokens,
@@ -1103,6 +1087,7 @@ Your information:
             # sum row
             sum_row = [
                 "Sum",
+                "-",
                 sum(r.total_prompt_tokens for r in results),
                 sum(r.total_completion_tokens for r in results),
                 sum(r.total_tokens for r in results),
