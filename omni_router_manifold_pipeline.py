@@ -2,7 +2,7 @@
 title: Omni Router Manifold Pipeline
 author: Moeakwak
 date: 2025-04-30
-version: 0.4.0
+version: 0.4.1
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -37,11 +37,17 @@ import copy
 class Model(BaseModel):
     provider: str
     code: str
-    extra_identifier: Optional[str] = Field(default=None, description="Extra identifier for the model. Useful for creating multiple instances of the same model.")
+    extra_identifier: Optional[str] = Field(
+        default=None, description="Extra identifier for the model. Useful for creating multiple instances of the same model."
+    )
     human_name: Optional[str] = Field(default=None)
     prompt_price: Optional[float] = Field(default=None, description="The prompt price of the model per 1M tokens.")
     completion_price: Optional[float] = Field(default=None, description="The completion price of the model per 1M tokens.")
     per_message_price: Optional[float] = Field(default=None, description="The price of the model per message.")
+    max_tokens: Optional[int] = Field(
+        default=None,
+        description="Override the max tokens of the model. Has the highest priority then user preference. Set to -1 to disable max tokens.",
+    )
     disable_cost_display_in_completion: Optional[bool] = Field(
         default=False, description="If true, disable showing the cost in the completion. Non-stream completions always don't show the cost."
     )
@@ -139,6 +145,14 @@ def print_and_raise(message: str):
     raise Exception(message)
 
 
+def print_curl_example(provider: Provider, payload: dict):
+    print_log(
+        f"Curl example:\n--------------------------------\n"
+        f"curl -X POST {provider.url}/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer {provider.api_key}' -d '{json.dumps(payload, ensure_ascii=False)}'"
+        f"\n--------------------------------"
+    )
+
+
 class Pipeline:
     class Valves(BaseModel):
         MODELS_CONFIG_YAML_PATH: str = "/app/pipelines/omni_router.yaml"
@@ -157,6 +171,7 @@ class Pipeline:
         REQUEST_TIMEOUT: int = Field(default=300, description="The timeout of the request connection in seconds.")
         DEBUG_MODE: bool = Field(default=True, description="If true, show debug logs.")
         DEBUG_SHORTEN_LOG: bool = Field(default=False, description="If true, shorten the log.")
+        DEBUG_PRINT_CURL_EXAMPLE: bool = Field(default=False, description="If true, print the curl example for current request.")
 
     class ReasoningState(Enum):
         """Enum for tracking the state of reasoning in stream response"""
@@ -192,6 +207,7 @@ class Pipeline:
                 "AUXILIARY_MODEL_CODE": os.getenv("AUXILIARY_MODEL_CODE", "gpt-4o-mini"),
                 "DEBUG_MODE": False if os.getenv("DEBUG_MODE", "false").lower() == "false" else True,
                 "DEBUG_SHORTEN_LOG": False if os.getenv("DEBUG_SHORTEN_LOG", "true").lower() == "false" else True,
+                "DEBUG_PRINT_CURL_EXAMPLE": False if os.getenv("DEBUG_PRINT_CURL_EXAMPLE", "false").lower() == "false" else True,
             }
         )
         self.config = self.load_config()
@@ -347,6 +363,7 @@ class Pipeline:
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         user_info = body.pop("user")
+        # self.print_debug(f"body: {json.dumps(body, indent=2)}")
         self.print_debug(f"PRINT BODY: {mask_message_content(body, self.valves.DEBUG_SHORTEN_LOG)}")
 
         try:
@@ -374,6 +391,11 @@ class Pipeline:
             if model.include_reasoning:
                 payload["include_reasoning"] = True
 
+            if model.max_tokens:
+                payload["max_tokens"] = model.max_tokens
+                if model.max_tokens == -1:
+                    del payload["max_tokens"]
+
             if model.extra_args:
                 payload = {**payload, **model.extra_args}
 
@@ -399,8 +421,13 @@ class Pipeline:
 
             self.print_debug(f"PAYLOAD: {mask_message_content(payload, self.valves.DEBUG_SHORTEN_LOG)}")
 
+            if self.valves.DEBUG_PRINT_CURL_EXAMPLE:
+                print_curl_example(provider, payload)
+
             try:
-                r = requests.post(url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=self.valves.REQUEST_TIMEOUT)
+                r = requests.post(
+                    url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=self.valves.REQUEST_TIMEOUT
+                )
 
                 # 检查响应状态码
                 if r.status_code != 200:
@@ -567,6 +594,9 @@ class Pipeline:
                 except json.JSONDecodeError:
                     print_log(f"Error decoding JSON: {line}", model.code, user.name)
                     continue
+
+                if "error" in chunk and chunk["error"] is not None:
+                    yield "data: " + json.dumps({"choices": [{"delta": {"content": f"Error: {chunk['error']}"}}]}) + "\n\n"
 
                 if "choices" in chunk and len(chunk["choices"]) > 0:
                     delta = chunk["choices"][0].get("delta", {})
@@ -891,7 +921,9 @@ class ServiceBot:
             result = self.commands[args.command](args, user)
         except Exception as e:
             print_log(f"Error executing command: {e}")
-            return f"An error occurred while executing the command: {e}\n\n" + f"```\n{clean_usage(added_parsers_map[args.command].format_usage())}\n```"
+            return (
+                f"An error occurred while executing the command: {e}\n\n" + f"```\n{clean_usage(added_parsers_map[args.command].format_usage())}\n```"
+            )
 
         return result
 
@@ -1055,7 +1087,7 @@ Your information:
 
             if user_id:
                 query = query.where(UsageLog.user_id == user_id)
-            
+
             if provider:
                 query = query.where(UsageLog.provider.like(f"%{provider}%"))
 
